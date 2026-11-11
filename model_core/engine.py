@@ -93,35 +93,37 @@ def _fallback_data_file_for_symbol(symbol: str) -> tuple[str | None, str | None]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_walk_forward_folds(T: int, n_folds: int = 5, gap: int = 20) -> list[dict]:
-    """构建 Walk-Forward 折叠。
+    """构建具有真实 purge gap 的滚动训练/验证窗口。
 
-    改为 rolling window（train_start = (k-1)*fold_size）以避免 expanding window
-    导致早期折的 val 数据被后续折的 train 切片包含，造成 val_score 不再严格 OOS。
-
-    同时修正最后一折 val_end = min(val_start + fold_size, T)，避免最后一折 val
-    大小不均导致均值被该折主导。
+    将时间序列划分为 n_folds 个等长块，各块之间保留 gap 根 K 线。
+    每一折用前一块训练、后一块验证；train_start 会随折数推进。
+    绝不静默将指定 gap 缩为 0：数据不足时退化为单个全量折，
+    调用方会将其标记为非 Walk-Forward，不能声称样本外验证。
+    注意：这些验证折仍参与因子筛选，最终性能需要另留 untouched holdout。
     """
-    fold_size = T // n_folds
-    if fold_size < 2:
-        return [{"train_start": 0, "train_end": T, "val_start": 0, "val_end": T, "gap": 0}]
-    total_required = fold_size * n_folds + gap * (n_folds - 1)
-    if total_required > T:
-        gap = max(0, (T - fold_size * n_folds) // n_folds)
+    if T < 0 or n_folds < 2 or gap < 0:
+        raise ValueError("T must be nonnegative, n_folds >= 2 and gap >= 0")
+    fallback = [{"train_start": 0, "train_end": T,
+                 "val_start": 0, "val_end": T, "gap": 0}]
+    # 先从总长度中预留 n_folds-1 段 gap，再均分训练/验证块。
+    # 保证每块至少有 2 根 K 线且不短于 gap，避免极薄的伪验证窗口。
+    fold_size = (T - gap * (n_folds - 1)) // n_folds
+    if fold_size < max(2, gap):
+        return fallback
+
+    stride = fold_size + gap
     folds = []
     for k in range(1, n_folds):
-        # rolling window：每折 train 起点前移，避免包含早期折的 val 切片
-        train_start = (k - 1) * fold_size
-        train_end   = k * fold_size
-        val_start   = train_end + gap
-        # 最后一折 val_end 用 min 避免超出 T，且与其他折大小一致
-        val_end     = min(val_start + fold_size, T)
-        if val_start >= T or val_end <= val_start:
+        train_start = (k - 1) * stride
+        train_end = train_start + fold_size
+        val_start = train_end + gap
+        val_end = val_start + fold_size
+        if val_end > T:
             break
         folds.append({"train_start": train_start, "train_end": train_end,
                       "val_start": val_start, "val_end": val_end, "gap": gap})
-    if not folds:
-        return [{"train_start": 0, "train_end": T, "val_start": 0, "val_end": T, "gap": 0}]
-    return folds
+    return folds or fallback
+
 
 
 def _repetition_penalty(formula: list[int]) -> float:
