@@ -18,11 +18,11 @@ from model_core.backtest import MT5Backtest
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_default_cost_rate():
-    """MT5Backtest 默认 cost_rate 应为 0.0001（forex/metals 点差+佣金）。
-    Requirements: 5.2
-    """
+    """默认交易成本应始终与运行配置一致，防止测试滞后于成本模型。"""
+    from config import Config
+
     bt = MT5Backtest()
-    assert bt.cost_rate == 0.0001
+    assert bt.cost_rate == pytest.approx(Config.COST_RATE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
