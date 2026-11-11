@@ -4,11 +4,8 @@
 验证以下需求：
   T2.1 – 正常情况下每折 val_start == train_end + gap
   T2.2 – 越界折不被添加（折叠不越界）
-  T2.3 – 数据量不足时 gap 自动缩减；T < n_folds×2 时退化为单折
+  T2.3 – 数据量不足时显式退化为非 OOS 单折，绝不静默缩小 gap
 """
-import sys
-sys.path.insert(0, r'd:\cl\MT5_AlphaGPT')
-
 import pytest
 from model_core.engine import _build_walk_forward_folds
 
@@ -28,7 +25,7 @@ class TestNormalCase:
             )
 
     def test_gap_preserved_when_data_sufficient(self):
-        """当数据充足时（T mod n_folds >= gap*(n_folds-1)），gap 不被缩减。
+        """当数据充足时，即使 T mod n_folds 较小也必须保留指定 gap。
         T=53, n_folds=3, gap=1：53 mod 3 = 2 >= 1*(3-1)=2，gap 恰好被保留为 1。
         """
         folds = _build_walk_forward_folds(T=53, n_folds=3, gap=1)
@@ -42,13 +39,12 @@ class TestNormalCase:
         folds = _build_walk_forward_folds(T=500, n_folds=5, gap=20)
         assert len(folds) == 4
 
-    def test_train_start_always_zero(self):
-        """所有折的 train_start 都为 0（扩展训练窗口）。"""
+    def test_train_start_moves_forward(self):
+        """rolling-window 每折训练起点必须向前推进，而非全部从 0 开始。"""
         folds = _build_walk_forward_folds(T=500, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            assert fold["train_start"] == 0, (
-                f"折 {i}: train_start 应为 0，实际为 {fold['train_start']}"
-            )
+        assert [f["train_start"] for f in folds] == [0, 104, 208, 312]
+        assert all(f["gap"] == 20 for f in folds)
+        assert all(f["val_end"] - f["val_start"] == 84 for f in folds)
 
     def test_val_end_within_bounds(self):
         """所有折的 val_end <= T。"""
@@ -79,44 +75,37 @@ class TestGapZero:
 
 
 class TestInsufficientData:
-    """T2.3 – 数据量不足时 gap 自动缩减，折叠不越界。"""
+    """T2.3 – 无法满足 purge gap 时不制造虚假的 Walk-Forward 验证。"""
 
-    def test_no_fold_has_val_start_beyond_T(self):
-        """T=50, n_folds=5, gap=20：gap 应被自动缩减，所有折 val_start < T。"""
+    def test_infeasible_gap_falls_back_without_pretending_oos(self):
         T = 50
         folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            assert fold["val_start"] < T, (
-                f"折 {i}: val_start={fold['val_start']} >= T={T}"
-            )
+        assert folds == [{
+            "train_start": 0, "train_end": T,
+            "val_start": 0, "val_end": T, "gap": 0,
+        }]
 
-    def test_no_fold_has_val_end_beyond_T(self):
-        """T=50, n_folds=5, gap=20：所有折 val_end <= T。"""
-        T = 50
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            assert fold["val_end"] <= T, (
-                f"折 {i}: val_end={fold['val_end']} > T={T}"
-            )
+    def test_feasible_gap_is_never_silently_reduced(self):
+        folds = _build_walk_forward_folds(T=120, n_folds=5, gap=5)
+        assert len(folds) == 4
+        assert all(f["gap"] == 5 for f in folds)
 
-    def test_gap_reduced_when_insufficient_data(self):
-        """T=50, n_folds=5, gap=20：实际 gap 应 < 20（已缩减）。"""
-        T = 50
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        for fold in folds:
-            assert fold["gap"] < 20, (
-                f"数据不足时 gap 应缩减，但折 gap={fold['gap']}"
-            )
+    def test_each_validation_block_is_disjoint_and_equal_length(self):
+        for T, n_folds, gap in ((500, 5, 20), (53, 3, 1), (120, 5, 5)):
+            folds = _build_walk_forward_folds(T=T, n_folds=n_folds, gap=gap)
+            assert len(folds) == n_folds - 1
+            for f in folds:
+                assert 0 <= f["train_start"] < f["train_end"]
+                assert f["train_end"] + gap == f["val_start"]
+                assert f["val_start"] < f["val_end"] <= T
+                assert f["train_end"] - f["train_start"] == f["val_end"] - f["val_start"]
 
-    def test_val_start_still_equals_train_end_plus_actual_gap(self):
-        """数据不足时缩减后的 gap 仍满足 val_start == train_end + actual_gap。"""
-        folds = _build_walk_forward_folds(T=50, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            actual_gap = fold["gap"]
-            assert fold["val_start"] == fold["train_end"] + actual_gap, (
-                f"折 {i}: val_start={fold['val_start']} != "
-                f"train_end={fold['train_end']} + gap={actual_gap}"
-            )
+    @pytest.mark.parametrize("T,n_folds,gap", [
+        (-1, 5, 20), (500, 1, 20), (500, 5, -1),
+    ])
+    def test_invalid_args(self, T, n_folds, gap):
+        with pytest.raises(ValueError):
+            _build_walk_forward_folds(T=T, n_folds=n_folds, gap=gap)
 
 
 class TestDegenerateCase:
